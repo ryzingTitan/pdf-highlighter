@@ -9,18 +9,78 @@ pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs'
 type PageLayer = {
   textDivs: HTMLElement[]
   itemStrs: string[]
+  headerIndices: Set<number>
   pageStr: string
-  offsets: { start: number; end: number }[]
+  offsets: { start: number; end: number; itemIndex: number }[]
 }
 
-function buildOffsets(itemStrs: string[]) {
-  const offsets: { start: number; end: number }[] = []
+function buildOffsets(itemStrs: string[], headerIndices: Set<number>) {
+  const offsets: { start: number; end: number; itemIndex: number }[] = []
   let pos = 0
-  for (const str of itemStrs) {
-    offsets.push({ start: pos, end: pos + str.length })
-    pos += str.length + 1
+  for (let i = 0; i < itemStrs.length; i++) {
+    if (headerIndices.has(i)) continue
+    offsets.push({ start: pos, end: pos + itemStrs[i].length, itemIndex: i })
+    pos += itemStrs[i].length + 1
   }
   return offsets
+}
+
+async function detectHeaderLineY(page: pdfjs.PDFPageProxy): Promise<number | null> {
+  const { width: pageWidth } = page.getViewport({ scale: 1 })
+  const ops = await page.getOperatorList()
+  const { fnArray, argsArray } = ops
+
+  // Track CTM through save/restore/transform ops so bbox coords can be
+  // converted to PDF user space (same system as text item transform[5]).
+  let ctm = [1, 0, 0, 1, 0, 0]
+  const ctmStack: number[][] = []
+
+  function applyCtm(x: number, y: number): [number, number] {
+    return [
+      ctm[0]*x + ctm[2]*y + ctm[4],
+      ctm[1]*x + ctm[3]*y + ctm[5],
+    ]
+  }
+
+  for (let i = 0; i < fnArray.length; i++) {
+    const fn = fnArray[i]
+    if (fn === pdfjs.OPS.save) {
+      ctmStack.push([...ctm])
+    } else if (fn === pdfjs.OPS.restore) {
+      if (ctmStack.length) ctm = ctmStack.pop()!
+    } else if (fn === pdfjs.OPS.transform) {
+      const [a2,b2,c2,d2,e2,f2] = argsArray[i] as number[]
+      const [a1,b1,c1,d1,e1,f1] = ctm
+      ctm = [
+        a1*a2+c1*b2, b1*a2+d1*b2,
+        a1*c2+c1*d2, b1*c2+d1*d2,
+        a1*e2+c1*f2+e1, b1*e2+d1*f2+f1,
+      ]
+    } else if (fn === pdfjs.OPS.constructPath) {
+      const bbox = argsArray[i][2]
+      if (!bbox) continue
+      const [x1, y1] = applyCtm(bbox[0], bbox[1])
+      const [x2, y2] = applyCtm(bbox[2], bbox[3])
+      const lineWidth = Math.abs(x2 - x1)
+      const lineHeight = Math.abs(y2 - y1)
+      // A header separator is a wide (>50% page width), hairline (<3pt) horizontal rule.
+      // Form-section borders are taller (typically 14+ pt) and are filtered by lineHeight.
+      if (lineWidth > pageWidth * 0.5 && lineHeight < 3) {
+        return Math.min(y1, y2)
+      }
+    }
+  }
+  return null
+}
+
+function buildHeaderIndices(textItems: pdfjs.TextItem[], separatorY: number | null): Set<number> {
+  if (separatorY === null) return new Set()
+  return new Set(
+    textItems
+      .map((item, i) => ({ y: item.transform[5], i }))
+      .filter(({ y }) => y > separatorY)
+      .map(({ i }) => i)
+  )
 }
 
 function escapeHTML(s: string): string {
@@ -111,6 +171,12 @@ export default function PDFViewer() {
         tlDiv.style.setProperty('--total-scale-factor', String(scale))
 
         const textContent = await page.getTextContent()
+        const textItems = textContent.items.filter(
+          (item): item is pdfjs.TextItem => 'str' in item
+        )
+        const separatorY = await detectHeaderLineY(page)
+        const headerIndices = buildHeaderIndices(textItems, separatorY)
+
         const tl = new pdfjs.TextLayer({
           textContentSource: textContent,
           container: tlDiv,
@@ -120,11 +186,13 @@ export default function PDFViewer() {
         await tl.render()
 
         const itemStrs = tl.textContentItemsStr
+        const itemStrsArr = [...itemStrs]
         layers.push({
           textDivs: tl.textDivs as HTMLElement[],
-          itemStrs: [...itemStrs],
-          pageStr: itemStrs.join(' '),
-          offsets: buildOffsets(itemStrs),
+          itemStrs: itemStrsArr,
+          headerIndices,
+          pageStr: itemStrsArr.filter((_, i) => !headerIndices.has(i)).join(' '),
+          offsets: buildOffsets(itemStrsArr, headerIndices),
         })
       }
 
@@ -138,7 +206,6 @@ export default function PDFViewer() {
     let total = 0
 
     for (const { textDivs, itemStrs, pageStr, offsets } of pageLayers) {
-      // Restore all spans to their original plain text
       textDivs.forEach((div, i) => {
         div.textContent = itemStrs[i]
       })
@@ -155,27 +222,25 @@ export default function PDFViewer() {
         if (found === -1) break
 
         const matchEnd = found + query.length
-        const overlapping = offsets
-          .map((o, i) => ({ ...o, i }))
-          .filter(o => o.start < matchEnd && o.end > found)
+        const overlapping = offsets.filter(o => o.start < matchEnd && o.end > found)
 
         if (overlapping.length > 0) {
           total++
-          for (const { i, start, end } of overlapping) {
+          for (const { itemIndex, start, end } of overlapping) {
             const localStart = Math.max(found, start) - start
             const localEnd = Math.min(matchEnd, end) - start
-            if (!itemRanges.has(i)) itemRanges.set(i, [])
-            itemRanges.get(i)!.push([localStart, localEnd])
+            if (!itemRanges.has(itemIndex)) itemRanges.set(itemIndex, [])
+            itemRanges.get(itemIndex)!.push([localStart, localEnd])
           }
         }
 
         idx = found + 1
       }
 
-      for (const [i, ranges] of itemRanges) {
-        const div = textDivs[i]
+      for (const [itemIdx, ranges] of itemRanges) {
+        const div = textDivs[itemIdx]
         if (!div) continue
-        div.innerHTML = buildHighlightedHTML(itemStrs[i], mergeRanges(ranges))
+        div.innerHTML = buildHighlightedHTML(itemStrs[itemIdx], mergeRanges(ranges))
       }
     }
 
