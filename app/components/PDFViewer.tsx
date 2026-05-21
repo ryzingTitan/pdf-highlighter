@@ -20,7 +20,7 @@ function buildOffsets(itemStrs: string[], headerIndices: Set<number>) {
   for (let i = 0; i < itemStrs.length; i++) {
     if (headerIndices.has(i)) continue
     offsets.push({ start: pos, end: pos + itemStrs[i].length, itemIndex: i })
-    pos += itemStrs[i].length + 1
+    pos += itemStrs[i].length
   }
   return offsets
 }
@@ -83,21 +83,6 @@ function buildHeaderIndices(textItems: pdfjs.TextItem[], separatorY: number | nu
   )
 }
 
-function escapeHTML(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-function buildHighlightedHTML(text: string, ranges: [number, number][]): string {
-  let html = ''
-  let pos = 0
-  for (const [start, end] of ranges) {
-    html += escapeHTML(text.slice(pos, start))
-    html += `<span class="highlight">${escapeHTML(text.slice(start, end))}</span>`
-    pos = end
-  }
-  return html + escapeHTML(text.slice(pos))
-}
-
 function mergeRanges(ranges: [number, number][]): [number, number][] {
   if (!ranges.length) return []
   const sorted = [...ranges].sort((a, b) => a[0] - b[0])
@@ -120,6 +105,7 @@ export default function PDFViewer() {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([])
   const textLayerRefs = useRef<(HTMLDivElement | null)[]>([])
+  const pageRefs = useRef<(HTMLDivElement | null)[]>([])
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
@@ -191,7 +177,7 @@ export default function PDFViewer() {
           textDivs: tl.textDivs as HTMLElement[],
           itemStrs: itemStrsArr,
           headerIndices,
-          pageStr: itemStrsArr.filter((_, i) => !headerIndices.has(i)).join(' '),
+          pageStr: itemStrsArr.filter((_, i) => !headerIndices.has(i)).join(''),
           offsets: buildOffsets(itemStrsArr, headerIndices),
         })
       }
@@ -203,15 +189,19 @@ export default function PDFViewer() {
   }, [pdfDoc])
 
   useEffect(() => {
+    pageRefs.current.forEach(pg => {
+      pg?.querySelectorAll('[data-highlight]').forEach(el => el.remove())
+    })
+
     let total = 0
 
-    for (const { textDivs, itemStrs, pageStr, offsets } of pageLayers) {
+    pageLayers.forEach(({ textDivs, itemStrs, pageStr, offsets }, pageIndex) => {
       textDivs.forEach((div, i) => {
         div.textContent = itemStrs[i]
       })
 
       const query = searchQuery.trim().toLowerCase()
-      if (!query) continue
+      if (!query) return
 
       const text = pageStr.toLowerCase()
       const itemRanges = new Map<number, [number, number][]>()
@@ -237,12 +227,35 @@ export default function PDFViewer() {
         idx = found + 1
       }
 
+      const pageDiv = pageRefs.current[pageIndex]
+      if (!pageDiv) return
+      const pageRect = pageDiv.getBoundingClientRect()
+
       for (const [itemIdx, ranges] of itemRanges) {
         const div = textDivs[itemIdx]
         if (!div) continue
-        div.innerHTML = buildHighlightedHTML(itemStrs[itemIdx], mergeRanges(ranges))
+        const textNode = div.firstChild
+        if (!textNode || textNode.nodeType !== Node.TEXT_NODE) continue
+        const textLen = (textNode as Text).length
+
+        for (const [localStart, localEnd] of mergeRanges(ranges)) {
+          const clampedEnd = Math.min(localEnd, textLen)
+          if (localStart >= clampedEnd) continue
+
+          const range = document.createRange()
+          range.setStart(textNode, localStart)
+          range.setEnd(textNode, clampedEnd)
+
+          const rect = range.getBoundingClientRect()
+          if (rect.width === 0 && rect.height === 0) continue
+
+          const overlay = document.createElement('div')
+          overlay.dataset.highlight = ''
+          overlay.style.cssText = `position:absolute;left:${rect.left - pageRect.left}px;top:${rect.top - pageRect.top}px;width:${rect.width}px;height:${rect.height}px;background:rgba(255,200,0,0.45);border-radius:4px;pointer-events:none;`
+          pageDiv.appendChild(overlay)
+        }
       }
-    }
+    })
 
     setMatchCount(total)
   }, [searchQuery, pageLayers])
@@ -291,7 +304,7 @@ export default function PDFViewer() {
       {pdfDoc && (
         <div ref={containerRef} className="flex flex-col gap-4 w-full">
           {Array.from({ length: pdfDoc.numPages }, (_, i) => (
-            <div key={i} style={{ position: 'relative' }}>
+            <div key={i} ref={(el) => { pageRefs.current[i] = el }} style={{ position: 'relative' }}>
               <canvas
                 ref={(el) => { canvasRefs.current[i] = el }}
                 className="w-full shadow-md rounded"
