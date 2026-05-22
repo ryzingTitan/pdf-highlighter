@@ -6,12 +6,16 @@ import type { PDFDocumentProxy } from 'pdfjs-dist'
 
 pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs'
 
+type OcrChar = { char: string; left: number; top: number; width: number; height: number }
+type OcrWord = { text: string; left: number; top: number; width: number; height: number; chars: OcrChar[] }
+
 type PageLayer = {
   textDivs: HTMLElement[]
   itemStrs: string[]
   headerIndices: Set<number>
   pageStr: string
   offsets: { start: number; end: number; itemIndex: number }[]
+  ocrWords: OcrWord[]
 }
 
 function buildOffsets(itemStrs: string[], headerIndices: Set<number>) {
@@ -95,6 +99,91 @@ function mergeRanges(ranges: [number, number][]): [number, number][] {
   return out
 }
 
+async function extractImageOcrWords(
+  page: pdfjs.PDFPageProxy,
+  canvas: HTMLCanvasElement,
+  viewport: pdfjs.PageViewport,
+): Promise<OcrWord[]> {
+  const ops = await page.getOperatorList()
+  const { fnArray, argsArray } = ops
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return []
+
+  let ctm = [1, 0, 0, 1, 0, 0]
+  const ctmStack: number[][] = []
+  const words: OcrWord[] = []
+
+  for (let i = 0; i < fnArray.length; i++) {
+    const fn = fnArray[i]
+    if (fn === pdfjs.OPS.save) {
+      ctmStack.push([...ctm])
+    } else if (fn === pdfjs.OPS.restore) {
+      if (ctmStack.length) ctm = ctmStack.pop()!
+    } else if (fn === pdfjs.OPS.transform) {
+      const [a2, b2, c2, d2, e2, f2] = argsArray[i] as number[]
+      const [a1, b1, c1, d1, e1, f1] = ctm
+      ctm = [
+        a1*a2+c1*b2, b1*a2+d1*b2,
+        a1*c2+c1*d2, b1*c2+d1*d2,
+        a1*e2+c1*f2+e1, b1*e2+d1*f2+f1,
+      ]
+    } else if (fn === pdfjs.OPS.paintImageXObject || fn === pdfjs.OPS.paintInlineImageXObject) {
+      // Image occupies unit square in current coordinate space; CTM maps it to PDF user space.
+      const pdfCorners: [number, number][] = [
+        [ctm[4],              ctm[5]],
+        [ctm[0]+ctm[4],       ctm[1]+ctm[5]],
+        [ctm[2]+ctm[4],       ctm[3]+ctm[5]],
+        [ctm[0]+ctm[2]+ctm[4], ctm[1]+ctm[3]+ctm[5]],
+      ]
+      const vpPts = pdfCorners.map(([x, y]) => viewport.convertToViewportPoint(x, y))
+      const xs = vpPts.map(p => p[0])
+      const ys = vpPts.map(p => p[1])
+      const x0 = Math.max(0, Math.round(Math.min(...xs)))
+      const y0 = Math.max(0, Math.round(Math.min(...ys)))
+      const x1 = Math.min(canvas.width, Math.round(Math.max(...xs)))
+      const y1 = Math.min(canvas.height, Math.round(Math.max(...ys)))
+      if (x1 <= x0 || y1 <= y0) continue
+
+      const imageData = ctx.getImageData(x0, y0, x1 - x0, y1 - y0)
+      const tmpCanvas = document.createElement('canvas')
+      tmpCanvas.width = x1 - x0
+      tmpCanvas.height = y1 - y0
+      tmpCanvas.getContext('2d')!.putImageData(imageData, 0, 0)
+
+      const { createWorker } = await import('tesseract.js')
+      const worker = await createWorker('eng')
+      try {
+        const { data } = await worker.recognize(tmpCanvas, {}, { blocks: true })
+        const ocrWordList = (data.blocks ?? []).flatMap(b =>
+          b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words))
+        )
+        for (const word of ocrWordList) {
+          if (!word.text.trim()) continue
+          const chars: OcrChar[] = (word.symbols ?? []).map(sym => ({
+            char: sym.text,
+            left: x0 + sym.bbox.x0,
+            top: y0 + sym.bbox.y0,
+            width: sym.bbox.x1 - sym.bbox.x0,
+            height: sym.bbox.y1 - sym.bbox.y0,
+          }))
+          words.push({
+            text: word.text,
+            left: x0 + word.bbox.x0,
+            top: y0 + word.bbox.y0,
+            width: word.bbox.x1 - word.bbox.x0,
+            height: word.bbox.y1 - word.bbox.y0,
+            chars,
+          })
+        }
+      } finally {
+        await worker.terminate()
+      }
+    }
+  }
+
+  return words
+}
+
 export default function PDFViewer() {
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null)
   const [loading, setLoading] = useState(false)
@@ -102,6 +191,7 @@ export default function PDFViewer() {
   const [searchQuery, setSearchQuery] = useState('')
   const [pageLayers, setPageLayers] = useState<PageLayer[]>([])
   const [matchCount, setMatchCount] = useState(0)
+  const [ocrLoading, setOcrLoading] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([])
   const textLayerRefs = useRef<(HTMLDivElement | null)[]>([])
@@ -136,9 +226,12 @@ export default function PDFViewer() {
 
     async function renderPages() {
       const layers: PageLayer[] = []
+      const pageProxies: pdfjs.PDFPageProxy[] = []
 
+      // Phase 1: render canvas and text layer for each page
       for (let pageNum = 1; pageNum <= pdfDoc!.numPages; pageNum++) {
         const page = await pdfDoc!.getPage(pageNum)
+        pageProxies.push(page)
         const baseViewport = page.getViewport({ scale: 1 })
         const scale = containerWidth / baseViewport.width
         const viewport = page.getViewport({ scale })
@@ -179,10 +272,31 @@ export default function PDFViewer() {
           headerIndices,
           pageStr: itemStrsArr.filter((_, i) => !headerIndices.has(i)).join(''),
           offsets: buildOffsets(itemStrsArr, headerIndices),
+          ocrWords: [],
         })
       }
 
-      setPageLayers(layers)
+      setPageLayers([...layers])
+
+      // Phase 2: OCR image regions on each page
+      setOcrLoading(true)
+      try {
+        for (let i = 0; i < pageProxies.length; i++) {
+          const canvas = canvasRefs.current[i]
+          if (!canvas) continue
+          const page = pageProxies[i]
+          const baseViewport = page.getViewport({ scale: 1 })
+          const scale = containerWidth / baseViewport.width
+          const viewport = page.getViewport({ scale })
+          const ocrWords = await extractImageOcrWords(page, canvas, viewport)
+          if (ocrWords.length > 0) {
+            layers[i] = { ...layers[i], ocrWords }
+            setPageLayers([...layers])
+          }
+        }
+      } finally {
+        setOcrLoading(false)
+      }
     }
 
     renderPages()
@@ -195,7 +309,7 @@ export default function PDFViewer() {
 
     let total = 0
 
-    pageLayers.forEach(({ textDivs, itemStrs, pageStr, offsets }, pageIndex) => {
+    pageLayers.forEach(({ textDivs, itemStrs, pageStr, offsets, ocrWords }, pageIndex) => {
       textDivs.forEach((div, i) => {
         div.textContent = itemStrs[i]
       })
@@ -255,6 +369,38 @@ export default function PDFViewer() {
           pageDiv.appendChild(overlay)
         }
       }
+
+      if (query) {
+        for (const word of ocrWords) {
+          const wordLower = word.text.toLowerCase()
+          let charIdx = 0
+          while (true) {
+            const found = wordLower.indexOf(query, charIdx)
+            if (found === -1) break
+            total++
+            const matchChars = word.chars.slice(found, found + query.length)
+            let left: number, top: number, width: number, height: number
+            if (matchChars.length === query.length) {
+              left   = Math.min(...matchChars.map(c => c.left))
+              top    = Math.min(...matchChars.map(c => c.top))
+              width  = Math.max(...matchChars.map(c => c.left + c.width)) - left
+              height = Math.max(...matchChars.map(c => c.top + c.height)) - top
+            } else {
+              const s = found / word.text.length
+              const e = (found + query.length) / word.text.length
+              left = word.left + s * word.width
+              top = word.top
+              width = (e - s) * word.width
+              height = word.height
+            }
+            const overlay = document.createElement('div')
+            overlay.dataset.highlight = ''
+            overlay.style.cssText = `position:absolute;left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:rgba(255,200,0,0.45);border-radius:4px;pointer-events:none;`
+            pageDiv.appendChild(overlay)
+            charIdx = found + 1
+          }
+        }
+      }
     })
 
     setMatchCount(total)
@@ -288,6 +434,11 @@ export default function PDFViewer() {
               {matchCount === 0
                 ? 'No matches found'
                 : `${matchCount} match${matchCount === 1 ? '' : 'es'} found`}
+            </p>
+          )}
+          {ocrLoading && (
+            <p className="text-xs text-zinc-400 dark:text-zinc-500 animate-pulse">
+              Analyzing images…
             </p>
           )}
         </div>
