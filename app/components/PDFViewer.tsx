@@ -18,6 +18,11 @@ type PageLayer = {
   ocrWords: OcrWord[]
 }
 
+type PageDimension = { width: number; height: number; scale: number }
+
+// pdfjs-dist does not re-export TextItem from its main entry point
+type TextItem = { str: string; dir: string; width: number; height: number; transform: number[]; fontName: string; hasEOL: boolean }
+
 function buildOffsets(itemStrs: string[], headerIndices: Set<number>) {
   const offsets: { start: number; end: number; itemIndex: number }[] = []
   let pos = 0
@@ -77,7 +82,7 @@ async function detectHeaderLineY(page: pdfjs.PDFPageProxy): Promise<number | nul
   return null
 }
 
-function buildHeaderIndices(textItems: pdfjs.TextItem[], separatorY: number | null): Set<number> {
+function buildHeaderIndices(textItems: TextItem[], separatorY: number | null): Set<number> {
   if (separatorY === null) return new Set()
   return new Set(
     textItems
@@ -189,28 +194,233 @@ export default function PDFViewer() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
-  const [pageLayers, setPageLayers] = useState<PageLayer[]>([])
+  const [pageDimensions, setPageDimensions] = useState<PageDimension[]>([])
+  const [renderedPages, setRenderedPages] = useState<Set<number>>(new Set())
+  const [pageLayersMap, setPageLayersMap] = useState<Map<number, PageLayer>>(new Map())
   const [matchCount, setMatchCount] = useState(0)
-  const [ocrLoading, setOcrLoading] = useState(false)
+
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([])
   const textLayerRefs = useRef<(HTMLDivElement | null)[]>([])
   const pageRefs = useRef<(HTMLDivElement | null)[]>([])
+  const blobUrlRef = useRef<string | null>(null)
+  const renderQueueRef = useRef<number[]>([])
+  const renderingRef = useRef<boolean>(false)
+  const observerRef = useRef<IntersectionObserver | null>(null)
+  const textIndexAbortRef = useRef<AbortController | null>(null)
+  // Mirrors of state for reading inside async closures without stale captures
+  const pageDimensionsRef = useRef<PageDimension[]>([])
+  const pageLayersMapRef = useRef<Map<number, PageLayer>>(new Map())
+  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  async function prefetchDimensions(doc: PDFDocumentProxy) {
+    const containerWidth = containerRef.current?.clientWidth ?? 800
+    const dims: PageDimension[] = []
+    for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+      const page = await doc.getPage(pageNum)
+      const baseViewport = page.getViewport({ scale: 1 })
+      const scale = containerWidth / baseViewport.width
+      const viewport = page.getViewport({ scale })
+      dims.push({ width: viewport.width, height: viewport.height, scale })
+    }
+    pageDimensionsRef.current = dims
+    setPageDimensions(dims)
+  }
+
+  async function startBackgroundTextIndex(doc: PDFDocumentProxy, abort: AbortController) {
+    const BATCH_SIZE = 50
+    let pendingBatch = 0
+
+    for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+      if (abort.signal.aborted) return
+      const pageIndex = pageNum - 1
+
+      const page = await doc.getPage(pageNum)
+      const textContent = await page.getTextContent()
+      if (abort.signal.aborted) { page.cleanup(); return }
+
+      const textItems = textContent.items.filter(
+        (item): item is TextItem => 'str' in item
+      )
+      const separatorY = await detectHeaderLineY(page)
+      if (abort.signal.aborted) { page.cleanup(); return }
+
+      const headerIndices = buildHeaderIndices(textItems, separatorY)
+      const itemStrs = textItems.map(item => item.str)
+      const pageStr = itemStrs.filter((_, i) => !headerIndices.has(i)).join('')
+      const offsets = buildOffsets(itemStrs, headerIndices)
+
+      const layer: PageLayer = {
+        textDivs: [],
+        itemStrs,
+        headerIndices,
+        pageStr,
+        offsets,
+        ocrWords: [],
+      }
+
+      // Skip if renderPage already populated real textDivs for this page (atomic check+write)
+      if (!pageLayersMapRef.current.get(pageIndex)?.textDivs.length) {
+        pageLayersMapRef.current.set(pageIndex, layer)
+        pendingBatch++
+      }
+
+      page.cleanup()
+
+      if (pendingBatch >= BATCH_SIZE || pageNum === doc.numPages) {
+        setPageLayersMap(new Map(pageLayersMapRef.current))
+        pendingBatch = 0
+      }
+    }
+  }
+
+  async function renderPage(pageIndex: number, doc: PDFDocumentProxy) {
+    const dim = pageDimensionsRef.current[pageIndex]
+    if (!dim) return
+
+    const canvas = canvasRefs.current[pageIndex]
+    const tlDiv = textLayerRefs.current[pageIndex]
+    if (!canvas || !tlDiv) return
+
+    const pageNum = pageIndex + 1
+    const page = await doc.getPage(pageNum)
+    const viewport = page.getViewport({ scale: dim.scale })
+
+    canvas.width = viewport.width
+    canvas.height = viewport.height
+    await page.render({ canvas, viewport }).promise
+
+    tlDiv.innerHTML = ''
+    tlDiv.style.setProperty('--total-scale-factor', String(dim.scale))
+    pdfjs.setLayerDimensions(tlDiv, viewport)
+
+    const textContent = await page.getTextContent()
+    const tl = new pdfjs.TextLayer({
+      textContentSource: textContent,
+      container: tlDiv,
+      viewport,
+    })
+    await tl.render()
+
+    const textItems = textContent.items.filter(
+      (item): item is TextItem => 'str' in item
+    )
+    // Reuse headerIndices from background indexer to skip a redundant getOperatorList call
+    const existing = pageLayersMapRef.current.get(pageIndex)
+    const headerIndices = existing?.headerIndices ?? buildHeaderIndices(
+      textItems,
+      await detectHeaderLineY(page)
+    )
+    const itemStrs = [...tl.textContentItemsStr]
+    const layer: PageLayer = {
+      textDivs: tl.textDivs as HTMLElement[],
+      itemStrs,
+      headerIndices,
+      pageStr: itemStrs.filter((_, i) => !headerIndices.has(i)).join(''),
+      offsets: buildOffsets(itemStrs, headerIndices),
+      ocrWords: existing?.ocrWords ?? [],
+    }
+
+    const newMap = new Map(pageLayersMapRef.current)
+    newMap.set(pageIndex, layer)
+    pageLayersMapRef.current = newMap
+    setPageLayersMap(new Map(newMap))
+    setRenderedPages(prev => new Set(prev).add(pageIndex))
+
+    const ocrWords = await extractImageOcrWords(page, canvas, viewport)
+    if (ocrWords.length > 0) {
+      const withOcr = { ...layer, ocrWords }
+      const mapWithOcr = new Map(pageLayersMapRef.current)
+      mapWithOcr.set(pageIndex, withOcr)
+      pageLayersMapRef.current = mapWithOcr
+      setPageLayersMap(new Map(mapWithOcr))
+    }
+
+    page.cleanup()
+  }
+
+  function unloadPage(pageIndex: number) {
+    renderQueueRef.current = renderQueueRef.current.filter(i => i !== pageIndex)
+
+    const canvas = canvasRefs.current[pageIndex]
+    if (canvas) {
+      canvas.width = 0
+      canvas.height = 0
+    }
+    const tlDiv = textLayerRefs.current[pageIndex]
+    if (tlDiv) tlDiv.innerHTML = ''
+
+    pageRefs.current[pageIndex]?.querySelectorAll('[data-highlight]').forEach(el => el.remove())
+
+    // Clear textDivs from the layer so search effect skips overlay creation for this page.
+    // pageStr/offsets are kept so match counting continues to work.
+    const existing = pageLayersMapRef.current.get(pageIndex)
+    if (existing && existing.textDivs.length > 0) {
+      pageLayersMapRef.current.set(pageIndex, { ...existing, textDivs: [] })
+      // No setState here — renderedPages removal is the trigger for the search effect.
+    }
+
+    setRenderedPages(prev => {
+      const next = new Set(prev)
+      next.delete(pageIndex)
+      return next
+    })
+  }
+
+  function enqueueRender(pageIndex: number, doc: PDFDocumentProxy) {
+    if (renderQueueRef.current.includes(pageIndex)) return
+    renderQueueRef.current.push(pageIndex)
+    if (!renderingRef.current) {
+      processRenderQueue(doc)
+    }
+  }
+
+  async function processRenderQueue(doc: PDFDocumentProxy) {
+    if (renderingRef.current) return
+    renderingRef.current = true
+    while (renderQueueRef.current.length > 0) {
+      const pageIndex = renderQueueRef.current.shift()!
+      await renderPage(pageIndex, doc)
+    }
+    renderingRef.current = false
+  }
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
 
+    // Cleanup previous document state
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current)
+      blobUrlRef.current = null
+    }
+    textIndexAbortRef.current?.abort()
+    textIndexAbortRef.current = null
+    observerRef.current?.disconnect()
+    observerRef.current = null
+    renderQueueRef.current = []
+    renderingRef.current = false
+    if (resizeTimerRef.current) {
+      clearTimeout(resizeTimerRef.current)
+      resizeTimerRef.current = null
+    }
+
     setLoading(true)
     setError(null)
     setPdfDoc(null)
-    setPageLayers([])
+    setPageDimensions([])
+    pageDimensionsRef.current = []
+    setRenderedPages(new Set())
+    const emptyMap = new Map<number, PageLayer>()
+    setPageLayersMap(emptyMap)
+    pageLayersMapRef.current = emptyMap
     setSearchQuery('')
     setMatchCount(0)
 
     try {
-      const data = await file.arrayBuffer()
-      const doc = await pdfjs.getDocument({ data }).promise
+      const url = URL.createObjectURL(file)
+      blobUrlRef.current = url
+      const doc = await pdfjs.getDocument({ url }).promise
       setPdfDoc(doc)
     } catch {
       setError('Failed to load PDF. Make sure the file is a valid PDF.')
@@ -219,89 +429,89 @@ export default function PDFViewer() {
     }
   }
 
+  // Dimension pre-fetch, then fire-and-forget background text indexing
   useEffect(() => {
     if (!pdfDoc) return
 
-    const containerWidth = containerRef.current?.clientWidth ?? 800
+    let cancelled = false
 
-    async function renderPages() {
-      const layers: PageLayer[] = []
-      const pageProxies: pdfjs.PDFPageProxy[] = []
-
-      // Phase 1: render canvas and text layer for each page
-      for (let pageNum = 1; pageNum <= pdfDoc!.numPages; pageNum++) {
-        const page = await pdfDoc!.getPage(pageNum)
-        pageProxies.push(page)
-        const baseViewport = page.getViewport({ scale: 1 })
-        const scale = containerWidth / baseViewport.width
-        const viewport = page.getViewport({ scale })
-
-        const canvas = canvasRefs.current[pageNum - 1]
-        if (!canvas) continue
-
-        canvas.width = viewport.width
-        canvas.height = viewport.height
-
-        await page.render({ canvas, viewport }).promise
-
-        const tlDiv = textLayerRefs.current[pageNum - 1]
-        if (!tlDiv) continue
-
-        tlDiv.style.setProperty('--total-scale-factor', String(scale))
-
-        const textContent = await page.getTextContent()
-        const textItems = textContent.items.filter(
-          (item): item is pdfjs.TextItem => 'str' in item
-        )
-        const separatorY = await detectHeaderLineY(page)
-        const headerIndices = buildHeaderIndices(textItems, separatorY)
-
-        const tl = new pdfjs.TextLayer({
-          textContentSource: textContent,
-          container: tlDiv,
-          viewport,
-        })
-        pdfjs.setLayerDimensions(tlDiv, viewport)
-        await tl.render()
-
-        const itemStrs = tl.textContentItemsStr
-        const itemStrsArr = [...itemStrs]
-        layers.push({
-          textDivs: tl.textDivs as HTMLElement[],
-          itemStrs: itemStrsArr,
-          headerIndices,
-          pageStr: itemStrsArr.filter((_, i) => !headerIndices.has(i)).join(''),
-          offsets: buildOffsets(itemStrsArr, headerIndices),
-          ocrWords: [],
-        })
-      }
-
-      setPageLayers([...layers])
-
-      // Phase 2: OCR image regions on each page
-      setOcrLoading(true)
-      try {
-        for (let i = 0; i < pageProxies.length; i++) {
-          const canvas = canvasRefs.current[i]
-          if (!canvas) continue
-          const page = pageProxies[i]
-          const baseViewport = page.getViewport({ scale: 1 })
-          const scale = containerWidth / baseViewport.width
-          const viewport = page.getViewport({ scale })
-          const ocrWords = await extractImageOcrWords(page, canvas, viewport)
-          if (ocrWords.length > 0) {
-            layers[i] = { ...layers[i], ocrWords }
-            setPageLayers([...layers])
-          }
-        }
-      } finally {
-        setOcrLoading(false)
-      }
+    async function init() {
+      await prefetchDimensions(pdfDoc!)
+      if (cancelled) return
+      const abort = new AbortController()
+      textIndexAbortRef.current = abort
+      startBackgroundTextIndex(pdfDoc!, abort)
     }
 
-    renderPages()
+    init()
+    return () => { cancelled = true }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pdfDoc])
 
+  // IntersectionObserver setup — runs after placeholder divs are mounted in DOM
+  useEffect(() => {
+    if (!pdfDoc || pageDimensions.length === 0) return
+
+    observerRef.current?.disconnect()
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const pageIndex = Number((entry.target as HTMLElement).dataset.pageIndex)
+          if (isNaN(pageIndex)) continue
+          if (entry.isIntersecting) {
+            enqueueRender(pageIndex, pdfDoc)
+          } else {
+            unloadPage(pageIndex)
+          }
+        }
+      },
+      {
+        root: null,
+        rootMargin: '800px 0px 800px 0px',
+        threshold: 0,
+      }
+    )
+
+    observerRef.current = observer
+    pageRefs.current.forEach(div => { if (div) observer.observe(div) })
+
+    return () => {
+      observer.disconnect()
+      observerRef.current = null
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdfDoc, pageDimensions])
+
+  // Resize observer — re-fetch dimensions and re-render at new scale
+  useEffect(() => {
+    if (!pdfDoc || !containerRef.current) return
+
+    const el = containerRef.current
+    const ro = new ResizeObserver(() => {
+      if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current)
+      resizeTimerRef.current = setTimeout(() => {
+        prefetchDimensions(pdfDoc)
+        setRenderedPages(new Set())
+        renderQueueRef.current = []
+      }, 300)
+    })
+
+    ro.observe(el)
+    return () => ro.disconnect()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pdfDoc])
+
+  // Unmount cleanup
+  useEffect(() => {
+    return () => {
+      observerRef.current?.disconnect()
+      textIndexAbortRef.current?.abort()
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
+    }
+  }, [])
+
+  // Search + highlight overlays
   useEffect(() => {
     pageRefs.current.forEach(pg => {
       pg?.querySelectorAll('[data-highlight]').forEach(el => el.remove())
@@ -309,13 +519,13 @@ export default function PDFViewer() {
 
     let total = 0
 
-    pageLayers.forEach(({ textDivs, itemStrs, pageStr, offsets, ocrWords }, pageIndex) => {
+    for (const [pageIndex, { textDivs, itemStrs, pageStr, offsets, ocrWords }] of pageLayersMap.entries()) {
       textDivs.forEach((div, i) => {
         div.textContent = itemStrs[i]
       })
 
       const query = searchQuery.trim().toLowerCase()
-      if (!query) return
+      if (!query) continue
 
       const text = pageStr.toLowerCase()
       const itemRanges = new Map<number, [number, number][]>()
@@ -341,8 +551,25 @@ export default function PDFViewer() {
         idx = found + 1
       }
 
+      // DOM overlays only for rendered pages with live textDivs
+      if (!renderedPages.has(pageIndex) || textDivs.length === 0) {
+        if (query) {
+          for (const word of ocrWords) {
+            const wordLower = word.text.toLowerCase()
+            let charIdx = 0
+            while (true) {
+              const found = wordLower.indexOf(query, charIdx)
+              if (found === -1) break
+              total++
+              charIdx = found + 1
+            }
+          }
+        }
+        continue
+      }
+
       const pageDiv = pageRefs.current[pageIndex]
-      if (!pageDiv) return
+      if (!pageDiv) continue
       const pageRect = pageDiv.getBoundingClientRect()
 
       for (const [itemIdx, ranges] of itemRanges) {
@@ -401,10 +628,10 @@ export default function PDFViewer() {
           }
         }
       }
-    })
+    }
 
     setMatchCount(total)
-  }, [searchQuery, pageLayers])
+  }, [searchQuery, pageLayersMap, renderedPages])
 
   return (
     <div className="flex flex-col items-center gap-6 w-full">
@@ -420,7 +647,7 @@ export default function PDFViewer() {
         />
       </label>
 
-      {pdfDoc && (
+      {pageDimensions.length > 0 && (
         <div className="flex flex-col items-center gap-2 w-full max-w-md">
           <input
             type="text"
@@ -436,11 +663,6 @@ export default function PDFViewer() {
                 : `${matchCount} match${matchCount === 1 ? '' : 'es'} found`}
             </p>
           )}
-          {ocrLoading && (
-            <p className="text-xs text-zinc-400 dark:text-zinc-500 animate-pulse">
-              Analyzing images…
-            </p>
-          )}
         </div>
       )}
 
@@ -448,26 +670,35 @@ export default function PDFViewer() {
         <p className="text-zinc-500 dark:text-zinc-400 animate-pulse">Loading PDF…</p>
       )}
 
+      {pdfDoc && pageDimensions.length === 0 && !loading && (
+        <p className="text-zinc-500 dark:text-zinc-400 animate-pulse">Preparing pages…</p>
+      )}
+
       {error && (
         <p className="text-red-500">{error}</p>
       )}
 
-      {pdfDoc && (
-        <div ref={containerRef} className="flex flex-col gap-4 w-full">
-          {Array.from({ length: pdfDoc.numPages }, (_, i) => (
-            <div key={i} ref={(el) => { pageRefs.current[i] = el }} style={{ position: 'relative' }}>
-              <canvas
-                ref={(el) => { canvasRefs.current[i] = el }}
-                className="w-full shadow-md rounded"
-              />
-              <div
-                ref={(el) => { textLayerRefs.current[i] = el }}
-                className="textLayer"
-              />
-            </div>
-          ))}
-        </div>
-      )}
+      {/* Always-rendered container so containerRef.clientWidth is available for dimension pre-fetch */}
+      <div ref={containerRef} className="flex flex-col gap-4 w-full">
+        {pageDimensions.map((dim, i) => (
+          <div
+            key={i}
+            ref={el => { pageRefs.current[i] = el }}
+            data-page-index={i}
+            style={{ position: 'relative', width: dim.width, height: dim.height, flexShrink: 0 }}
+          >
+            <canvas
+              ref={el => { canvasRefs.current[i] = el }}
+              className="shadow-md rounded"
+              style={{ display: 'block' }}
+            />
+            <div
+              ref={el => { textLayerRefs.current[i] = el }}
+              className="textLayer"
+            />
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
