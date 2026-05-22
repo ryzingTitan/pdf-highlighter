@@ -189,11 +189,19 @@ async function extractImageOcrWords(
   return words
 }
 
+function isWordBoundary(text: string, start: number, end: number): boolean {
+  const before = start > 0 ? text[start - 1] : ' '
+  const after = end < text.length ? text[end] : ' '
+  return !/[a-zA-Z0-9]/.test(before) && !/[a-zA-Z0-9]/.test(after)
+}
+
 export default function PDFViewer() {
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
+  const [wholeWord, setWholeWord] = useState(false)
+  const [showOptions, setShowOptions] = useState(false)
   const [pageDimensions, setPageDimensions] = useState<PageDimension[]>([])
   const [renderedPages, setRenderedPages] = useState<Set<number>>(new Set())
   const [pageLayersMap, setPageLayersMap] = useState<Map<number, PageLayer>>(new Map())
@@ -535,6 +543,11 @@ export default function PDFViewer() {
         const found = text.indexOf(query, idx)
         if (found === -1) break
 
+        if (wholeWord && !isWordBoundary(text, found, found + query.length)) {
+          idx = found + 1
+          continue
+        }
+
         const matchEnd = found + query.length
         const overlapping = offsets.filter(o => o.start < matchEnd && o.end > found)
 
@@ -560,7 +573,7 @@ export default function PDFViewer() {
             while (true) {
               const found = wordLower.indexOf(query, charIdx)
               if (found === -1) break
-              total++
+              if (!wholeWord || isWordBoundary(wordLower, found, found + query.length)) total++
               charIdx = found + 1
             }
           }
@@ -604,6 +617,10 @@ export default function PDFViewer() {
           while (true) {
             const found = wordLower.indexOf(query, charIdx)
             if (found === -1) break
+            if (wholeWord && !isWordBoundary(wordLower, found, found + query.length)) {
+              charIdx = found + 1
+              continue
+            }
             total++
             const matchChars = word.chars.slice(found, found + query.length)
             let left: number, top: number, width: number, height: number
@@ -631,7 +648,7 @@ export default function PDFViewer() {
     }
 
     setMatchCount(total)
-  }, [searchQuery, pageLayersMap, renderedPages])
+  }, [searchQuery, wholeWord, pageLayersMap, renderedPages])
 
   return (
     <div className="flex flex-col items-center gap-6 w-full">
@@ -657,6 +674,28 @@ export default function PDFViewer() {
               onChange={e => setSearchQuery(e.target.value)}
               className="w-full px-4 py-2 rounded-full border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 text-sm text-zinc-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-400"
             />
+            <div className="flex justify-center mt-1">
+              <button
+                onClick={() => setShowOptions(o => !o)}
+                className="text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300 flex items-center gap-1"
+              >
+                Options {showOptions ? '▲' : '▼'}
+              </button>
+            </div>
+            {showOptions && (
+              <div className="flex items-center gap-2 mt-1 justify-center">
+                <input
+                  type="checkbox"
+                  id="wholeWord"
+                  checked={wholeWord}
+                  onChange={e => setWholeWord(e.target.checked)}
+                  className="accent-zinc-700 dark:accent-zinc-300"
+                />
+                <label htmlFor="wholeWord" className="text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
+                  Whole word
+                </label>
+              </div>
+            )}
             {searchQuery.trim() && (
               <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1 text-center">
                 {matchCount === 0
