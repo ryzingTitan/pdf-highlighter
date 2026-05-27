@@ -202,6 +202,7 @@ export default function PDFViewer() {
   const [searchQuery, setSearchQuery] = useState('')
   const [wholeWord, setWholeWord] = useState(false)
   const [highlightImages, setHighlightImages] = useState(true)
+  const [excludeHeaders, setExcludeHeaders] = useState(true)
   const [showOptions, setShowOptions] = useState(false)
   const [pageDimensions, setPageDimensions] = useState<PageDimension[]>([])
   const [renderedPages, setRenderedPages] = useState<Set<number>>(new Set())
@@ -536,7 +537,10 @@ export default function PDFViewer() {
       const query = searchQuery.trim().toLowerCase()
       if (!query) continue
 
-      const text = pageStr.toLowerCase()
+      const effectivePageStr = excludeHeaders ? pageStr : itemStrs.join('')
+      const effectiveOffsets = excludeHeaders ? offsets : buildOffsets(itemStrs, new Set())
+
+      const text = effectivePageStr.toLowerCase()
       const itemRanges = new Map<number, [number, number][]>()
       let idx = 0
 
@@ -550,7 +554,7 @@ export default function PDFViewer() {
         }
 
         const matchEnd = found + query.length
-        const overlapping = offsets.filter(o => o.start < matchEnd && o.end > found)
+        const overlapping = effectiveOffsets.filter(o => o.start < matchEnd && o.end > found)
 
         if (overlapping.length > 0) {
           total++
@@ -649,7 +653,7 @@ export default function PDFViewer() {
     }
 
     setMatchCount(total)
-  }, [searchQuery, wholeWord, highlightImages, pageLayersMap, renderedPages])
+  }, [searchQuery, wholeWord, highlightImages, excludeHeaders, pageLayersMap, renderedPages])
 
   return (
     <div className="flex flex-col items-center gap-6 w-full">
@@ -707,6 +711,18 @@ export default function PDFViewer() {
                   />
                   <label htmlFor="highlightImages" className="text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
                     Highlight in images
+                  </label>
+                </div>
+                <div className="flex items-center gap-2 justify-center">
+                  <input
+                    type="checkbox"
+                    id="excludeHeaders"
+                    checked={excludeHeaders}
+                    onChange={e => setExcludeHeaders(e.target.checked)}
+                    className="accent-zinc-700 dark:accent-zinc-300"
+                  />
+                  <label htmlFor="excludeHeaders" className="text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
+                    Exclude header text
                   </label>
                 </div>
               </div>
