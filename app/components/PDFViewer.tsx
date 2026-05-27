@@ -201,6 +201,7 @@ export default function PDFViewer() {
   const [error, setError] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [wholeWord, setWholeWord] = useState(false)
+  const [highlightImages, setHighlightImages] = useState(true)
   const [showOptions, setShowOptions] = useState(false)
   const [pageDimensions, setPageDimensions] = useState<PageDimension[]>([])
   const [renderedPages, setRenderedPages] = useState<Set<number>>(new Set())
@@ -566,7 +567,7 @@ export default function PDFViewer() {
 
       // DOM overlays only for rendered pages with live textDivs
       if (!renderedPages.has(pageIndex) || textDivs.length === 0) {
-        if (query) {
+        if (highlightImages && query) {
           for (const word of ocrWords) {
             const wordLower = word.text.toLowerCase()
             let charIdx = 0
@@ -610,7 +611,7 @@ export default function PDFViewer() {
         }
       }
 
-      if (query) {
+      if (highlightImages && query) {
         for (const word of ocrWords) {
           const wordLower = word.text.toLowerCase()
           let charIdx = 0
@@ -648,7 +649,7 @@ export default function PDFViewer() {
     }
 
     setMatchCount(total)
-  }, [searchQuery, wholeWord, pageLayersMap, renderedPages])
+  }, [searchQuery, wholeWord, highlightImages, pageLayersMap, renderedPages])
 
   return (
     <div className="flex flex-col items-center gap-6 w-full">
@@ -683,17 +684,31 @@ export default function PDFViewer() {
               </button>
             </div>
             {showOptions && (
-              <div className="flex items-center gap-2 mt-1 justify-center">
-                <input
-                  type="checkbox"
-                  id="wholeWord"
-                  checked={wholeWord}
-                  onChange={e => setWholeWord(e.target.checked)}
-                  className="accent-zinc-700 dark:accent-zinc-300"
-                />
-                <label htmlFor="wholeWord" className="text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
-                  Whole word
-                </label>
+              <div className="flex flex-col items-center gap-1 mt-1">
+                <div className="flex items-center gap-2 justify-center">
+                  <input
+                    type="checkbox"
+                    id="wholeWord"
+                    checked={wholeWord}
+                    onChange={e => setWholeWord(e.target.checked)}
+                    className="accent-zinc-700 dark:accent-zinc-300"
+                  />
+                  <label htmlFor="wholeWord" className="text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
+                    Whole word
+                  </label>
+                </div>
+                <div className="flex items-center gap-2 justify-center">
+                  <input
+                    type="checkbox"
+                    id="highlightImages"
+                    checked={highlightImages}
+                    onChange={e => setHighlightImages(e.target.checked)}
+                    className="accent-zinc-700 dark:accent-zinc-300"
+                  />
+                  <label htmlFor="highlightImages" className="text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
+                    Highlight in images
+                  </label>
+                </div>
               </div>
             )}
             {searchQuery.trim() && (
