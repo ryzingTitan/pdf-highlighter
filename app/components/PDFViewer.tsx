@@ -204,6 +204,8 @@ export default function PDFViewer() {
   const [highlightImages, setHighlightImages] = useState(true)
   const [excludeHeaders, setExcludeHeaders] = useState(true)
   const [showOptions, setShowOptions] = useState(false)
+  const [loadWholeDocument, setLoadWholeDocument] = useState(true)
+  const [currentPage, setCurrentPage] = useState(0)
   const [pageDimensions, setPageDimensions] = useState<PageDimension[]>([])
   const [renderedPages, setRenderedPages] = useState<Set<number>>(new Set())
   const [pageLayersMap, setPageLayersMap] = useState<Map<number, PageLayer>>(new Map())
@@ -425,6 +427,7 @@ export default function PDFViewer() {
     setPageLayersMap(emptyMap)
     pageLayersMapRef.current = emptyMap
     setSearchQuery('')
+    setCurrentPage(0)
     setMatchCount(0)
 
     try {
@@ -458,11 +461,17 @@ export default function PDFViewer() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pdfDoc])
 
-  // IntersectionObserver setup — runs after placeholder divs are mounted in DOM
+  // IntersectionObserver setup (whole-document mode) or observer teardown (single-page mode)
   useEffect(() => {
     if (!pdfDoc || pageDimensions.length === 0) return
 
     observerRef.current?.disconnect()
+    observerRef.current = null
+
+    if (!loadWholeDocument) {
+      renderQueueRef.current = []
+      return
+    }
 
     const observer = new IntersectionObserver(
       (entries) => {
@@ -491,7 +500,19 @@ export default function PDFViewer() {
       observerRef.current = null
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pdfDoc, pageDimensions])
+  }, [pdfDoc, pageDimensions, loadWholeDocument])
+
+  // Single-page mode: render the current page on demand, unload it on navigation/mode change
+  useEffect(() => {
+    if (!pdfDoc || pageDimensions.length === 0 || loadWholeDocument) return
+
+    enqueueRender(currentPage, pdfDoc)
+
+    return () => {
+      unloadPage(currentPage)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage, loadWholeDocument, pdfDoc, pageDimensions])
 
   // Resize observer — re-fetch dimensions and re-render at new scale
   useEffect(() => {
@@ -725,6 +746,18 @@ export default function PDFViewer() {
                     Exclude header text
                   </label>
                 </div>
+                <div className="flex items-center gap-2 justify-center">
+                  <input
+                    type="checkbox"
+                    id="loadWholeDocument"
+                    checked={loadWholeDocument}
+                    onChange={e => setLoadWholeDocument(e.target.checked)}
+                    className="accent-zinc-700 dark:accent-zinc-300"
+                  />
+                  <label htmlFor="loadWholeDocument" className="text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
+                    Load whole document
+                  </label>
+                </div>
               </div>
             )}
             {searchQuery.trim() && (
@@ -757,7 +790,7 @@ export default function PDFViewer() {
             key={i}
             ref={el => { pageRefs.current[i] = el }}
             data-page-index={i}
-            style={{ position: 'relative', width: dim.width, height: dim.height, flexShrink: 0 }}
+            style={{ position: 'relative', width: dim.width, height: dim.height, flexShrink: 0, display: !loadWholeDocument && i !== currentPage ? 'none' : undefined }}
           >
             <canvas
               ref={el => { canvasRefs.current[i] = el }}
@@ -771,6 +804,28 @@ export default function PDFViewer() {
           </div>
         ))}
       </div>
+
+      {!loadWholeDocument && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-full shadow-lg px-4 py-2">
+          <button
+            onClick={() => setCurrentPage(p => Math.max(0, p - 1))}
+            disabled={currentPage === 0}
+            className="text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300 disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            ← Prev
+          </button>
+          <span className="text-xs text-zinc-600 dark:text-zinc-400">
+            Page {currentPage + 1} of {pageDimensions.length}
+          </span>
+          <button
+            onClick={() => setCurrentPage(p => Math.min(pageDimensions.length - 1, p + 1))}
+            disabled={currentPage === pageDimensions.length - 1}
+            className="text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:hover:text-zinc-300 disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            Next →
+          </button>
+        </div>
+      )}
     </div>
   )
 }
