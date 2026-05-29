@@ -3,36 +3,14 @@
 import { useEffect, useRef, useState } from 'react'
 import * as pdfjs from 'pdfjs-dist'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
+import usePDFHighlighting, { buildOffsets, PageLayer, OcrWord } from '../hooks/usePDFHighlighting'
 
 pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs'
-
-type OcrChar = { char: string; left: number; top: number; width: number; height: number }
-type OcrWord = { text: string; left: number; top: number; width: number; height: number; chars: OcrChar[] }
-
-type PageLayer = {
-  textDivs: HTMLElement[]
-  itemStrs: string[]
-  headerIndices: Set<number>
-  pageStr: string
-  offsets: { start: number; end: number; itemIndex: number }[]
-  ocrWords: OcrWord[]
-}
 
 type PageDimension = { width: number; height: number; scale: number }
 
 // pdfjs-dist does not re-export TextItem from its main entry point
 type TextItem = { str: string; dir: string; width: number; height: number; transform: number[]; fontName: string; hasEOL: boolean }
-
-function buildOffsets(itemStrs: string[], headerIndices: Set<number>) {
-  const offsets: { start: number; end: number; itemIndex: number }[] = []
-  let pos = 0
-  for (let i = 0; i < itemStrs.length; i++) {
-    if (headerIndices.has(i)) continue
-    offsets.push({ start: pos, end: pos + itemStrs[i].length, itemIndex: i })
-    pos += itemStrs[i].length
-  }
-  return offsets
-}
 
 async function detectHeaderLineY(page: pdfjs.PDFPageProxy): Promise<number | null> {
   const { width: pageWidth } = page.getViewport({ scale: 1 })
@@ -90,18 +68,6 @@ function buildHeaderIndices(textItems: TextItem[], separatorY: number | null): S
       .filter(({ y }) => y > separatorY)
       .map(({ i }) => i)
   )
-}
-
-function mergeRanges(ranges: [number, number][]): [number, number][] {
-  if (!ranges.length) return []
-  const sorted = [...ranges].sort((a, b) => a[0] - b[0])
-  const out: [number, number][] = [sorted[0]]
-  for (const [s, e] of sorted.slice(1)) {
-    const last = out[out.length - 1]
-    if (s <= last[1]) last[1] = Math.max(last[1], e)
-    else out.push([s, e])
-  }
-  return out
 }
 
 async function extractImageOcrWords(
@@ -164,7 +130,7 @@ async function extractImageOcrWords(
         )
         for (const word of ocrWordList) {
           if (!word.text.trim()) continue
-          const chars: OcrChar[] = (word.symbols ?? []).map(sym => ({
+          const chars = (word.symbols ?? []).map(sym => ({
             char: sym.text,
             left: x0 + sym.bbox.x0,
             top: y0 + sym.bbox.y0,
@@ -189,27 +155,14 @@ async function extractImageOcrWords(
   return words
 }
 
-function isWordBoundary(text: string, start: number, end: number): boolean {
-  const before = start > 0 ? text[start - 1] : ' '
-  const after = end < text.length ? text[end] : ' '
-  return !/[a-zA-Z0-9]/.test(before) && !/[a-zA-Z0-9]/.test(after)
-}
-
 export default function PDFViewer() {
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [searchQuery, setSearchQuery] = useState('')
-  const [wholeWord, setWholeWord] = useState(false)
-  const [highlightImages, setHighlightImages] = useState(true)
-  const [excludeHeaders, setExcludeHeaders] = useState(true)
-  const [showOptions, setShowOptions] = useState(false)
-  const [loadWholeDocument, setLoadWholeDocument] = useState(true)
   const [currentPage, setCurrentPage] = useState(0)
   const [pageDimensions, setPageDimensions] = useState<PageDimension[]>([])
   const [renderedPages, setRenderedPages] = useState<Set<number>>(new Set())
   const [pageLayersMap, setPageLayersMap] = useState<Map<number, PageLayer>>(new Map())
-  const [matchCount, setMatchCount] = useState(0)
 
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRefs = useRef<(HTMLCanvasElement | null)[]>([])
@@ -224,6 +177,23 @@ export default function PDFViewer() {
   const pageDimensionsRef = useRef<PageDimension[]>([])
   const pageLayersMapRef = useRef<Map<number, PageLayer>>(new Map())
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const {
+    searchQuery,
+    setSearchQuery,
+    wholeWord,
+    setWholeWord,
+    highlightImages,
+    setHighlightImages,
+    excludeHeaders,
+    setExcludeHeaders,
+    showOptions,
+    setShowOptions,
+    loadWholeDocument,
+    setLoadWholeDocument,
+    matchCount,
+    highlightOverlays,
+  } = usePDFHighlighting({ pageLayersMap, renderedPages, pageRefs })
 
   async function prefetchDimensions(doc: PDFDocumentProxy) {
     const containerWidth = containerRef.current?.clientWidth ?? 800
@@ -362,8 +332,6 @@ export default function PDFViewer() {
     const tlDiv = textLayerRefs.current[pageIndex]
     if (tlDiv) tlDiv.innerHTML = ''
 
-    pageRefs.current[pageIndex]?.querySelectorAll('[data-highlight]').forEach(el => el.remove())
-
     // Clear textDivs from the layer so search effect skips overlay creation for this page.
     // pageStr/offsets are kept so match counting continues to work.
     const existing = pageLayersMapRef.current.get(pageIndex)
@@ -428,7 +396,6 @@ export default function PDFViewer() {
     pageLayersMapRef.current = emptyMap
     setSearchQuery('')
     setCurrentPage(0)
-    setMatchCount(0)
 
     try {
       const url = URL.createObjectURL(file)
@@ -541,140 +508,6 @@ export default function PDFViewer() {
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
     }
   }, [])
-
-  // Search + highlight overlays
-  useEffect(() => {
-    pageRefs.current.forEach(pg => {
-      pg?.querySelectorAll('[data-highlight]').forEach(el => el.remove())
-    })
-
-    let total = 0
-
-    for (const [pageIndex, { textDivs, itemStrs, pageStr, offsets, ocrWords }] of pageLayersMap.entries()) {
-      textDivs.forEach((div, i) => {
-        div.textContent = itemStrs[i]
-      })
-
-      const query = searchQuery.trim().toLowerCase()
-      if (!query) continue
-
-      const effectivePageStr = excludeHeaders ? pageStr : itemStrs.join('')
-      const effectiveOffsets = excludeHeaders ? offsets : buildOffsets(itemStrs, new Set())
-
-      const text = effectivePageStr.toLowerCase()
-      const itemRanges = new Map<number, [number, number][]>()
-      let idx = 0
-
-      while (true) {
-        const found = text.indexOf(query, idx)
-        if (found === -1) break
-
-        if (wholeWord && !isWordBoundary(text, found, found + query.length)) {
-          idx = found + 1
-          continue
-        }
-
-        const matchEnd = found + query.length
-        const overlapping = effectiveOffsets.filter(o => o.start < matchEnd && o.end > found)
-
-        if (overlapping.length > 0) {
-          total++
-          for (const { itemIndex, start, end } of overlapping) {
-            const localStart = Math.max(found, start) - start
-            const localEnd = Math.min(matchEnd, end) - start
-            if (!itemRanges.has(itemIndex)) itemRanges.set(itemIndex, [])
-            itemRanges.get(itemIndex)!.push([localStart, localEnd])
-          }
-        }
-
-        idx = found + 1
-      }
-
-      // DOM overlays only for rendered pages with live textDivs
-      if (!renderedPages.has(pageIndex) || textDivs.length === 0) {
-        if (highlightImages && query) {
-          for (const word of ocrWords) {
-            const wordLower = word.text.toLowerCase()
-            let charIdx = 0
-            while (true) {
-              const found = wordLower.indexOf(query, charIdx)
-              if (found === -1) break
-              if (!wholeWord || isWordBoundary(wordLower, found, found + query.length)) total++
-              charIdx = found + 1
-            }
-          }
-        }
-        continue
-      }
-
-      const pageDiv = pageRefs.current[pageIndex]
-      if (!pageDiv) continue
-      const pageRect = pageDiv.getBoundingClientRect()
-
-      for (const [itemIdx, ranges] of itemRanges) {
-        const div = textDivs[itemIdx]
-        if (!div) continue
-        const textNode = div.firstChild
-        if (!textNode || textNode.nodeType !== Node.TEXT_NODE) continue
-        const textLen = (textNode as Text).length
-
-        for (const [localStart, localEnd] of mergeRanges(ranges)) {
-          const clampedEnd = Math.min(localEnd, textLen)
-          if (localStart >= clampedEnd) continue
-
-          const range = document.createRange()
-          range.setStart(textNode, localStart)
-          range.setEnd(textNode, clampedEnd)
-
-          const rect = range.getBoundingClientRect()
-          if (rect.width === 0 && rect.height === 0) continue
-
-          const overlay = document.createElement('div')
-          overlay.dataset.highlight = ''
-          overlay.style.cssText = `position:absolute;left:${rect.left - pageRect.left}px;top:${rect.top - pageRect.top}px;width:${rect.width}px;height:${rect.height}px;background:rgba(255,200,0,0.45);border-radius:4px;pointer-events:none;`
-          pageDiv.appendChild(overlay)
-        }
-      }
-
-      if (highlightImages && query) {
-        for (const word of ocrWords) {
-          const wordLower = word.text.toLowerCase()
-          let charIdx = 0
-          while (true) {
-            const found = wordLower.indexOf(query, charIdx)
-            if (found === -1) break
-            if (wholeWord && !isWordBoundary(wordLower, found, found + query.length)) {
-              charIdx = found + 1
-              continue
-            }
-            total++
-            const matchChars = word.chars.slice(found, found + query.length)
-            let left: number, top: number, width: number, height: number
-            if (matchChars.length === query.length) {
-              left   = Math.min(...matchChars.map(c => c.left))
-              top    = Math.min(...matchChars.map(c => c.top))
-              width  = Math.max(...matchChars.map(c => c.left + c.width)) - left
-              height = Math.max(...matchChars.map(c => c.top + c.height)) - top
-            } else {
-              const s = found / word.text.length
-              const e = (found + query.length) / word.text.length
-              left = word.left + s * word.width
-              top = word.top
-              width = (e - s) * word.width
-              height = word.height
-            }
-            const overlay = document.createElement('div')
-            overlay.dataset.highlight = ''
-            overlay.style.cssText = `position:absolute;left:${left}px;top:${top}px;width:${width}px;height:${height}px;background:rgba(255,200,0,0.45);border-radius:4px;pointer-events:none;`
-            pageDiv.appendChild(overlay)
-            charIdx = found + 1
-          }
-        }
-      }
-    }
-
-    setMatchCount(total)
-  }, [searchQuery, wholeWord, highlightImages, excludeHeaders, pageLayersMap, renderedPages])
 
   return (
     <div className="flex flex-col items-center gap-6 w-full">
@@ -801,6 +634,7 @@ export default function PDFViewer() {
               ref={el => { textLayerRefs.current[i] = el }}
               className="textLayer"
             />
+            {highlightOverlays.get(i)}
           </div>
         ))}
       </div>
